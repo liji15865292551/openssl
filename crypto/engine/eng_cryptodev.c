@@ -83,6 +83,9 @@ void engine_load_cryptodev_int(void)
 struct dev_crypto_state {
     struct session_op d_sess;
     int d_fd;
+    unsigned char *aad;
+    unsigned int aad_len;
+    unsigned int len;
 # ifdef USE_CRYPTODEV_DIGESTS
     char dummy_mac_key[HASH_MAX_LEN];
     unsigned char digest_res[HASH_MAX_LEN];
@@ -155,6 +158,8 @@ static int cryptodev_dh_compute_key(unsigned char *key, const BIGNUM *pub_key,
 static int cryptodev_ctrl(ENGINE *e, int cmd, long i, void *p,
                           void (*f) (void));
 void engine_load_cryptodev_int(void);
+static EVP_CIPHER *aes_128_cbc_hmac_sha1;
+static EVP_CIPHER *aes_256_cbc_hmac_sha1;
 
 static const ENGINE_CMD_DEFN cryptodev_defns[] = {
     {0, NULL, NULL, 0}
@@ -165,24 +170,25 @@ static struct {
     int nid;
     int ivmax;
     int keylen;
+    int mackeylen;
 } ciphers[] = {
     {
-        CRYPTO_ARC4, NID_rc4, 0, 16,
+        CRYPTO_ARC4, NID_rc4, 0, 16, 0
     },
     {
-        CRYPTO_DES_CBC, NID_des_cbc, 8, 8,
+        CRYPTO_DES_CBC, NID_des_cbc, 8, 8, 0
     },
     {
-        CRYPTO_3DES_CBC, NID_des_ede3_cbc, 8, 24,
+        CRYPTO_3DES_CBC, NID_des_ede3_cbc, 8, 24, 0
     },
     {
-        CRYPTO_AES_CBC, NID_aes_128_cbc, 16, 16,
+        CRYPTO_AES_CBC, NID_aes_128_cbc, 16, 16, 0
     },
     {
-        CRYPTO_AES_CBC, NID_aes_192_cbc, 16, 24,
+        CRYPTO_AES_CBC, NID_aes_192_cbc, 16, 24, 0
     },
     {
-        CRYPTO_AES_CBC, NID_aes_256_cbc, 16, 32,
+        CRYPTO_AES_CBC, NID_aes_256_cbc, 16, 32, 0
     },
 # ifdef CRYPTO_AES_CTR
     {
@@ -196,16 +202,22 @@ static struct {
     },
 # endif
     {
-        CRYPTO_BLF_CBC, NID_bf_cbc, 8, 16,
+        CRYPTO_BLF_CBC, NID_bf_cbc, 8, 16, 0
     },
     {
-        CRYPTO_CAST_CBC, NID_cast5_cbc, 8, 16,
+        CRYPTO_CAST_CBC, NID_cast5_cbc, 8, 16, 0
     },
     {
-        CRYPTO_SKIPJACK_CBC, NID_undef, 0, 0,
+        CRYPTO_SKIPJACK_CBC, NID_undef, 0, 0, 0
     },
     {
-        0, NID_undef, 0, 0,
+        CRYPTO_TLS10_AES_CBC_HMAC_SHA1, NID_aes_128_cbc_hmac_sha1, 16, 16, 20
+    },
+    {
+        CRYPTO_TLS10_AES_CBC_HMAC_SHA1, NID_aes_256_cbc_hmac_sha1, 16, 32, 20
+    },
+    {
+        0, NID_undef, 0, 0, 0
     },
 };
 
@@ -319,13 +331,15 @@ static int get_cryptodev_ciphers(const int **cnids)
     }
     memset(&sess, 0, sizeof(sess));
     sess.key = (caddr_t) "123456789abcdefghijklmno";
+    sess.mackey = (caddr_t) "123456789ABCDEFGHIJKLMNO";
 
     for (i = 0; ciphers[i].id && count < CRYPTO_ALGORITHM_MAX; i++) {
         if (ciphers[i].nid == NID_undef)
             continue;
         sess.cipher = ciphers[i].id;
         sess.keylen = ciphers[i].keylen;
-        sess.mac = 0;
+        sess.mackeylen = ciphers[i].mackeylen;
+
         if (ioctl(fd, CIOCGSESSION, &sess) != -1 &&
             ioctl(fd, CIOCFSESSION, &sess.ses) != -1)
             nids[count++] = ciphers[i].nid;
@@ -401,7 +415,21 @@ static int get_cryptodev_digests(const int **cnids)
  */
 static int cryptodev_usable_ciphers(const int **nids)
 {
-    return (get_cryptodev_ciphers(nids));
+    int i, count;
+
+    count = get_cryptodev_ciphers(nids);
+    /* add ciphers specific to cryptodev if found in kernel */
+    for (i = 0; i < count; i++) {
+        switch (*(*nids + i)) {
+        case NID_aes_128_cbc_hmac_sha1:
+            EVP_add_cipher(aes_128_cbc_hmac_sha1);
+            break;
+        case NID_aes_256_cbc_hmac_sha1:
+            EVP_add_cipher(aes_256_cbc_hmac_sha1);
+            break;
+        }
+    }
+    return count;
 }
 
 static int cryptodev_usable_digests(const int **nids)
@@ -482,6 +510,67 @@ cryptodev_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
     return (1);
 }
 
+static int cryptodev_aead_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+                                 const unsigned char *in, size_t len)
+{
+    struct crypt_auth_op cryp;
+    struct dev_crypto_state *state = EVP_CIPHER_CTX_get_cipher_data(ctx);
+    struct session_op *sess = &state->d_sess;
+    const void *iiv;
+    unsigned char save_iv[EVP_MAX_IV_LENGTH];
+
+    if (state->d_fd < 0)
+        return (0);
+    if (!len)
+        return (1);
+    if ((len % EVP_CIPHER_CTX_block_size(ctx)) != 0)
+        return (0);
+
+    memset(&cryp, 0, sizeof(cryp));
+
+    /* TODO: make a seamless integration with cryptodev flags */
+    switch (EVP_CIPHER_CTX_nid(ctx)) {
+    case NID_aes_128_cbc_hmac_sha1:
+    case NID_aes_256_cbc_hmac_sha1:
+        cryp.flags = COP_FLAG_AEAD_TLS_TYPE;
+    }
+    cryp.ses = sess->ses;
+    cryp.len = state->len;
+    cryp.src = (caddr_t) in;
+    cryp.dst = (caddr_t) out;
+    cryp.auth_src = state->aad;
+    cryp.auth_len = state->aad_len;
+
+    cryp.op = EVP_CIPHER_CTX_encrypting(ctx) ? COP_ENCRYPT : COP_DECRYPT;
+
+    if (EVP_CIPHER_CTX_iv_length(ctx) > 0) {
+        cryp.iv = (caddr_t) EVP_CIPHER_CTX_iv(ctx);
+        if (!EVP_CIPHER_CTX_encrypting(ctx)) {
+            iiv = in + len - EVP_CIPHER_CTX_iv_length(ctx);
+            memcpy(save_iv, iiv, EVP_CIPHER_CTX_iv_length(ctx));
+        }
+    } else
+        cryp.iv = NULL;
+
+    if (ioctl(state->d_fd, CIOCAUTHCRYPT, &cryp) == -1) {
+        /*
+         * XXX need better errror handling this can fail for a number of
+         * different reasons.
+         */
+        return (0);
+    }
+
+    if (EVP_CIPHER_CTX_iv_length(ctx) > 0) {
+        if (EVP_CIPHER_CTX_encrypting(ctx))
+            iiv = out + len - EVP_CIPHER_CTX_iv_length(ctx);
+        else
+            iiv = save_iv;
+        memcpy(EVP_CIPHER_CTX_iv_noconst(ctx), iiv,
+	       EVP_CIPHER_CTX_iv_length(ctx));
+    }
+    return (1);
+}
+
 static int
 cryptodev_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
                    const unsigned char *iv, int enc)
@@ -521,7 +610,46 @@ cryptodev_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
 }
 
 /*
- * free anything we allocated earlier when initing a
+ * Save the encryption key provided by upper layers. This function is called
+ * by EVP_CipherInit_ex to initialize the algorithm's extra data. We can't do
+ * much here because the mac key is not available. The next call should/will
+ * be to cryptodev_cbc_hmac_sha1_ctrl with parameter
+ * EVP_CTRL_AEAD_SET_MAC_KEY, to set the hmac key. There we call CIOCGSESSION
+ * with both the crypto and hmac keys.
+ */
+static int cryptodev_init_aead_key(EVP_CIPHER_CTX *ctx,
+                                   const unsigned char *key,
+                                   const unsigned char *iv, int enc)
+{
+    struct dev_crypto_state *state = EVP_CIPHER_CTX_get_cipher_data(ctx);
+    struct session_op *sess = &state->d_sess;
+    int cipher = -1, i;
+
+    for (i = 0; ciphers[i].id; i++)
+        if (EVP_CIPHER_CTX_nid(ctx) == ciphers[i].nid &&
+            EVP_CIPHER_CTX_iv_length(ctx) <= ciphers[i].ivmax &&
+            EVP_CIPHER_CTX_key_length(ctx) == ciphers[i].keylen) {
+            cipher = ciphers[i].id;
+            break;
+        }
+
+    if (!ciphers[i].id) {
+        state->d_fd = -1;
+        return (0);
+    }
+
+    memset(sess, 0, sizeof(*sess));
+
+    sess->key = (caddr_t) key;
+    sess->keylen = EVP_CIPHER_CTX_key_length(ctx);
+    sess->cipher = cipher;
+
+    /* for whatever reason, (1) means success */
+    return (1);
+}
+
+/*
+ * free anything we allocated earlier when initting a
  * session, and close the session.
  */
 static int cryptodev_cleanup(EVP_CIPHER_CTX *ctx)
@@ -552,6 +680,65 @@ static int cryptodev_cleanup(EVP_CIPHER_CTX *ctx)
     state->d_fd = -1;
 
     return (ret);
+}
+
+static int cryptodev_cbc_hmac_sha1_ctrl(EVP_CIPHER_CTX *ctx, int type,
+                                        int arg, void *ptr)
+{
+    switch (type) {
+    case EVP_CTRL_AEAD_SET_MAC_KEY:
+        {
+            /* TODO: what happens with hmac keys larger than 64 bytes? */
+            struct dev_crypto_state *state =
+		EVP_CIPHER_CTX_get_cipher_data(ctx);
+            struct session_op *sess = &state->d_sess;
+
+            if ((state->d_fd = get_dev_crypto()) < 0)
+                return (0);
+
+            /* the rest should have been set in cryptodev_init_aead_key */
+            sess->mackey = ptr;
+            sess->mackeylen = arg;
+
+            if (ioctl(state->d_fd, CIOCGSESSION, sess) == -1) {
+                put_dev_crypto(state->d_fd);
+                state->d_fd = -1;
+                return (0);
+            }
+            return (1);
+        }
+    case EVP_CTRL_AEAD_TLS1_AAD:
+        {
+            /* ptr points to the associated data buffer of 13 bytes */
+            struct dev_crypto_state *state =
+		EVP_CIPHER_CTX_get_cipher_data(ctx);
+            unsigned char *p = ptr;
+            unsigned int cryptlen = p[arg - 2] << 8 | p[arg - 1];
+            unsigned int maclen, padlen;
+            unsigned int bs = EVP_CIPHER_CTX_block_size(ctx);
+
+            state->aad = ptr;
+            state->aad_len = arg;
+            state->len = cryptlen;
+
+            /* TODO: this should be an extension of EVP_CIPHER struct */
+            switch (EVP_CIPHER_CTX_nid(ctx)) {
+            case NID_aes_128_cbc_hmac_sha1:
+            case NID_aes_256_cbc_hmac_sha1:
+                maclen = SHA_DIGEST_LENGTH;
+            }
+
+            /* space required for encryption (not only TLS padding) */
+            padlen = maclen;
+            if (EVP_CIPHER_CTX_encrypting(ctx)) {
+                cryptlen += maclen;
+                padlen += bs - (cryptlen % bs);
+            }
+            return padlen;
+        }
+    default:
+        return -1;
+    }
 }
 
 /*
@@ -744,6 +931,54 @@ static const EVP_CIPHER *cryptodev_aes_256_cbc(void)
     return aes_256_cbc_cipher;
 }
 
+static const EVP_CIPHER *cryptodev_aes_128_cbc_hmac_sha1(void)
+{
+    if (aes_128_cbc_hmac_sha1 == NULL) {
+        EVP_CIPHER *cipher;
+
+        if ((cipher = EVP_CIPHER_meth_new(NID_aes_128_cbc_hmac_sha1, 16, 16)) == NULL
+            || !EVP_CIPHER_meth_set_iv_length(cipher, 16)
+            || !EVP_CIPHER_meth_set_flags(cipher, EVP_CIPH_CBC_MODE |
+					  EVP_CIPH_FLAG_AEAD_CIPHER)
+            || !EVP_CIPHER_meth_set_init(cipher, cryptodev_init_aead_key)
+            || !EVP_CIPHER_meth_set_do_cipher(cipher, cryptodev_aead_cipher)
+            || !EVP_CIPHER_meth_set_cleanup(cipher, cryptodev_cleanup)
+            || !EVP_CIPHER_meth_set_impl_ctx_size(cipher, sizeof(struct dev_crypto_state))
+            || !EVP_CIPHER_meth_set_set_asn1_params(cipher, EVP_CIPHER_set_asn1_iv)
+            || !EVP_CIPHER_meth_set_get_asn1_params(cipher, EVP_CIPHER_get_asn1_iv)
+	    || !EVP_CIPHER_meth_set_ctrl(cipher, cryptodev_cbc_hmac_sha1_ctrl)) {
+            EVP_CIPHER_meth_free(cipher);
+            cipher = NULL;
+        }
+        aes_128_cbc_hmac_sha1 = cipher;
+    }
+    return aes_128_cbc_hmac_sha1;
+}
+
+static const EVP_CIPHER *cryptodev_aes_256_cbc_hmac_sha1(void)
+{
+    if (aes_256_cbc_hmac_sha1 == NULL) {
+        EVP_CIPHER *cipher;
+
+        if ((cipher = EVP_CIPHER_meth_new(NID_aes_256_cbc_hmac_sha1, 16, 32)) == NULL
+            || !EVP_CIPHER_meth_set_iv_length(cipher, 16)
+            || !EVP_CIPHER_meth_set_flags(cipher, EVP_CIPH_CBC_MODE |
+					  EVP_CIPH_FLAG_AEAD_CIPHER)
+            || !EVP_CIPHER_meth_set_init(cipher, cryptodev_init_aead_key)
+            || !EVP_CIPHER_meth_set_do_cipher(cipher, cryptodev_aead_cipher)
+            || !EVP_CIPHER_meth_set_cleanup(cipher, cryptodev_cleanup)
+            || !EVP_CIPHER_meth_set_impl_ctx_size(cipher, sizeof(struct dev_crypto_state))
+            || !EVP_CIPHER_meth_set_set_asn1_params(cipher, EVP_CIPHER_set_asn1_iv)
+            || !EVP_CIPHER_meth_set_get_asn1_params(cipher, EVP_CIPHER_get_asn1_iv)
+	    || !EVP_CIPHER_meth_set_ctrl(cipher, cryptodev_cbc_hmac_sha1_ctrl)) {
+            EVP_CIPHER_meth_free(cipher);
+            cipher = NULL;
+        }
+        aes_256_cbc_hmac_sha1 = cipher;
+    }
+    return aes_256_cbc_hmac_sha1;
+}
+
 # ifdef CRYPTO_AES_CTR
 static EVP_CIPHER *aes_ctr_cipher = NULL;
 static const EVP_CIPHER *cryptodev_aes_ctr(void)
@@ -862,6 +1097,12 @@ cryptodev_engine_ciphers(ENGINE *e, const EVP_CIPHER **cipher,
         *cipher = cryptodev_aes_256_ctr();
         break;
 # endif
+    case NID_aes_128_cbc_hmac_sha1:
+        *cipher = cryptodev_aes_128_cbc_hmac_sha1();
+        break;
+    case NID_aes_256_cbc_hmac_sha1:
+        *cipher = cryptodev_aes_256_cbc_hmac_sha1();
+        break;
     default:
         *cipher = NULL;
         break;
